@@ -23,6 +23,7 @@ public:
               rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true)) {}
 
     auto before_pairing(const OutputInfoMap& output_map) -> void override {
+        register_input("/predefined/timestamp", timestamp_);
         node::param("csv_path", csv_path_);
 
         {
@@ -71,7 +72,7 @@ public:
             return;
         }
 
-        csv_file_ << "index";
+        csv_file_ << "index,elapsed_s";
         for (const auto& unit : units_)
             csv_file_ << "," << unit->name;
         csv_file_ << "\n";
@@ -87,7 +88,14 @@ public:
         if (tick_++ % write_interval_ != 0)
             return;
 
-        csv_file_ << sample_count_++;
+        const auto now = *timestamp_;
+        if (!timestamp_initialized_) {
+            start_timestamp_ = now;
+            timestamp_initialized_ = true;
+        }
+
+        csv_file_ << sample_count_++ << ","
+                  << std::chrono::duration<double>(now - start_timestamp_).count();
         for (const auto& unit : units_)
             csv_file_ << "," << *unit->value;
         csv_file_ << "\n";
@@ -109,6 +117,11 @@ private:
 
     std::vector<std::unique_ptr<SignalUnit>> units_;
     std::ofstream csv_file_;
+
+    using Clock = std::chrono::steady_clock;
+    InputInterface<Clock::time_point> timestamp_;
+    Clock::time_point start_timestamp_{};
+    bool timestamp_initialized_ = false;
 
     int tick_ = 0;
     int sample_count_ = 0;

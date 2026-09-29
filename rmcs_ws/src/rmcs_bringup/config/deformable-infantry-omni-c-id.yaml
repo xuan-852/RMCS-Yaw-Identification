@@ -1,0 +1,304 @@
+# 步兵 C —— yaw 系统辨识试验配置（只动云台，下层底盘不加控制）
+#
+# 与 deformable-infantry-omni-c.yaml 的区别：
+#   1. 底盘全部控制器（模式管理/悬挂/功率/全向轮/四个摆臂关节）不加载
+#      -> 没有组件写 /chassis/*_joint/control_torque 与轮电机指令
+#      -> LK/M3508 电机输入为 NaN，硬件层自动发 disable（零电流）
+#      -> 四臂自然下垂、车轮自由，"立起来又掉下去"物理上不可能发生
+#   2. 裁判交互/机器人 UI、自动瞄准（含相机）不加载，减少不稳定源
+#      -> 云台控制器的 auto_aim 输入为 optional，缺失时安全降级为手动
+#   3. 云台控制器保留：yaw 正常受控（辨识对象），pitch 自动保持水平
+#   4. ValueCollector 启用，全速率记录 yaw 辨识信号
+#
+# 切换方式（车上）：
+#   试验模式: set-robot deformable-infantry-omni-c-id && service rmcs restart
+#   恢复正常: set-robot deformable-infantry-omni-c     && service rmcs restart
+
+rmcs_executor:
+  ros__parameters:
+    update_rate: 1000.0
+    components:
+      - rmcs_core::hardware::DeformableInfantryOmniC -> deformable_infantry
+
+      - rmcs_core::referee::Status -> referee_status
+      - rmcs_core::referee::Command -> referee_command
+
+      # - rmcs_core::referee::command::Interaction -> referee_interaction
+      # - rmcs_core::referee::command::interaction::Ui -> referee_ui
+      # - rmcs_core::referee::app::ui::DeformableInfantry -> referee_ui_infantry
+
+      - rmcs_core::controller::gimbal::DeformableInfantryGimbalController -> gimbal_controller
+
+      - rmcs_core::controller::shooting::FrictionWheelController -> friction_wheel_controller
+      - rmcs_core::controller::shooting::HeatController -> heat_controller
+      - rmcs_core::controller::shooting::BulletFeederController17mm -> bullet_feeder_controller
+      - rmcs_core::controller::pid::PidController -> left_friction_velocity_pid_controller
+      - rmcs_core::controller::pid::PidController -> right_friction_velocity_pid_controller
+      - rmcs_core::controller::pid::PidController -> bullet_feeder_velocity_pid_controller
+
+      # ---- 底盘控制器注释：辨识试验期间下层不施加任何控制 ----
+      # DeformableChassis 与 ChassisPowerController 必须保留（依赖链：
+      # 硬件节点要 /chassis/supercap/charge_power_limit <- ChassisPowerController
+      # <- /chassis/control_mode <- DeformableChassis）。
+      # 它们的姿态目标/速度指令的消费者（悬挂/轮控/关节）全部注释，
+      # 因此这两个组件只发悬空信号，不驱动任何电机。
+      - rmcs_core::controller::chassis::DeformableChassis -> chassis_controller
+      # - rmcs_core::controller::chassis::DeformableSuspension -> deformable_suspension
+      - rmcs_core::controller::chassis::ChassisPowerController -> chassis_power_controller
+      # - rmcs_core::controller::chassis::DeformableOmniWheelController -> deformable_chassis_controller
+      #
+      # - rmcs_core::controller::chassis::DeformableJointController -> lf_joint_controller
+      # - rmcs_core::controller::chassis::DeformableJointController -> lb_joint_controller
+      # - rmcs_core::controller::chassis::DeformableJointController -> rb_joint_controller
+      # - rmcs_core::controller::chassis::DeformableJointController -> rf_joint_controller
+
+      # ---- 自动瞄准与交互 UI 全部注释：辨识试验用不到 ----
+      # - rmcs::AutoAimRecorderComponent -> auto_aim_recorder
+      # - rmcs::AutoAimComponent -> auto_aim_component
+      # - rmcs::AutoAimCapturerComponent -> auto_aim_capturer
+      # - rmcs_core::referee::app::ui::AutoAimUi -> auto_aim_ui
+
+      # 标准激励协议控制器：静置15s -> 正弦30s -> 阶跃 -> 跟踪20s -> 自动结束
+      # 仅协议期间写 CSV（/tmp/yaw_identification_*.csv），触发手势：双中 -> 右拨杆上
+      # control_mode: "baseline" 复刻原控制器（A/B 基线）| "model" 同 PID + 模型前馈
+      - rmcs_core::controller::identification::YawIdentificationController -> yaw_identification_controller
+
+      # ValueCollector 已停用：只收集标准激励数据，不做全程记录
+      # - rmcs_core::debug::ValueCollector -> value_collector
+
+yaw_identification_controller:
+  ros__parameters:
+    # ================== 扫描模式开关 ==================
+    # condition_schedule 非空 -> 扫描模式：一次触发只跑【下一条】工况，每条一个独立 CSV
+    # condition_schedule 留空 -> 传统模式：一次触发跑完下面 4 段固定协议（与历史版本一致）
+    #
+    # 触发手势（两种模式相同）：左拨杆 MIDDLE + 右拨杆 MIDDLE -> UP 的上升沿
+    #   ★ 每次触发后必须把右拨杆拨回 MIDDLE，否则下一次不会触发
+    #   ★ 测试期间左拨杆不得离开中位；遥控双下 = 立即中止并保留已采集数据
+    #   ★ 扫描跑完后再拨一次 = 从第 1 条重来（用于补采/加热循环），日志会明确提示
+    #
+    # 语法：一行一条工况，'#' 之后为注释，字段 key=value
+    #   static dur=15
+    #   sine   amp=1.0 freq=0.20 dur=20
+    #   step   amp=2.0 hold=0.5 count=10
+    #   track  mode=baseline dur=20
+    # 任何语法/取值错误都会在【组件启动时】抛异常并打印行号（不会上车后才发现）
+    condition_schedule: |
+      # ---------- 1. 静置：陀螺零偏 + 噪声底 ----------
+      static dur=15
+      # ---------- 2-6. 频率扫描（1.0 N*m）：分离 J 与 B，系统拐点 ≈0.474 Hz ----------
+      sine   amp=1.0 freq=0.20 dur=20
+      sine   amp=1.0 freq=0.30 dur=20
+      sine   amp=1.0 freq=0.50 dur=20
+      sine   amp=1.0 freq=1.00 dur=20
+      sine   amp=1.0 freq=2.00 dur=20
+      # ---------- 7-10. 幅值扫描（0.5 Hz）：把 |w| 推到 3~6 rad/s，让 B*w 压过 tau_c ----------
+      sine   amp=1.5 freq=0.50 dur=20
+      sine   amp=2.5 freq=0.50 dur=20
+      sine   amp=3.5 freq=0.50 dur=20
+      sine   amp=4.0 freq=0.50 dur=20
+      # ---------- 11. 高速段（3.0 N*m @ 0.3 Hz，|w| 峰值 ≈5 rad/s，阻尼主导）----------
+      sine   amp=3.0 freq=0.30 dur=20
+      # ---------- 12-13. 低速摩擦曲线（0.1 Hz 准静态，含 breakaway 边界）----------
+      sine   amp=0.6 freq=0.10 dur=30
+      sine   amp=0.3 freq=0.10 dur=30
+      # ---------- 14-16. 阶跃：J 独立校验（起始加速度）+ 作动器滞后 ----------
+      step   amp=0.8 hold=0.5 count=10
+      step   amp=2.0 hold=0.5 count=10
+      step   amp=4.0 hold=0.5 count=10
+      # ---------- 17-22. 闭环 A/B 跟踪（±30° 脚本轨迹），baseline/model 交替各 3 次 ----------
+      track  mode=baseline dur=20
+      track  mode=model    dur=20
+      track  mode=baseline dur=20
+      track  mode=model    dur=20
+      track  mode=baseline dur=20
+      track  mode=model    dur=20
+      # ---------- 23-26. 加热段：把电机烤到 50~60 °C（每组记录温度，>65 °C 立即停）----------
+      sine   amp=3.0 freq=0.50 dur=40
+      sine   amp=3.5 freq=0.50 dur=40
+      sine   amp=3.0 freq=0.50 dur=40
+      sine   amp=2.5 freq=0.50 dur=40
+      # ---------- 27-30. 热机重复（与 4 / 8 / 12 对照，用于激励温度轴）----------
+      sine   amp=1.0 freq=0.50 dur=20
+      sine   amp=2.5 freq=0.50 dur=20
+      sine   amp=0.6 freq=0.10 dur=30
+      track  mode=model    dur=20
+
+    # ---- 传统模式参数（condition_schedule 留空时才生效；扫描模式下仅作解析默认值）----
+    static_duration_s: 15.0      # 静置时长
+    sine_duration_s: 30.0        # 正弦时长
+    sine_amplitude: 1.0          # 正弦力矩幅值 N*m
+    sine_frequency_hz: 0.5       # 正弦频率 Hz（2026-09-26 实际采数用的 0.5）
+    step_amplitude: 0.8          # 阶跃力矩幅值 N*m
+    step_duration_s: 0.5         # 每拍阶跃时长
+    step_count: 10               # 阶跃拍数（正负交替）
+    # ---- 安全限幅：扫描模式下每条工况的幅值都会在启动时逐条校验，超限直接报错 ----
+    torque_limit: 4.2            # 激励力矩硬限幅（原 1.5；扫幅值需要放到 4.0）
+    abort_velocity: 10.0         # IMU 角速度超限自动中止 rad/s
+                                 # 原 6.0 —— 4 N*m @ 0.3 Hz 峰值预测 ≈7 rad/s 会误触发中止
+    csv_directory: "/tmp"
+    # ---- 跟踪段（A/B 对照实验） ----
+    track_duration_s: 20.0       # 跟踪时长（阶跃10s + 正弦10s）
+    track_step_angle_deg: 30.0   # 跟踪阶跃目标角
+    track_step_hold_s: 2.5       # 每拍保持时长（4拍：+30/-30/+30/0 度）
+    track_sine_amplitude_deg: 30.0
+    track_sine_frequency_hz: 0.5
+    track_transition_s: 0.3      # 阶跃平滑过渡时长（保证参考加速度有限）
+    track_torque_limit: 4.5      # 跟踪段总力矩限幅（须 >= torque_limit；CAN ±2048 ≈ ±4.5 N*m 是硬顶）
+    control_mode: "model"        # 传统模式下 track 段用哪个模式
+    # ---- 辨识得到的模型参数 ----
+    # 2026-09-26 版（1ms 一步 ARX）: J=0.1503 B=0.6605 tau_c=0.201（R2=0.999/0.995）
+    # 2026-09-28 修正版（20~100ms 积分窗口辨识）: B 曾被作动器滞后污染、tau_c 偏小
+    #   修正后 4 N*m 跟踪段自由仿真 R2: 0.841 -> 0.927；两套参数前馈差值 RMS 0.211 N*m
+    #   若要和历史 A/B 数据严格对照，把下面三行改回 0.1503 / 0.6605 / 0.201
+    model_J: 0.1485              # kg*m^2
+    model_B: 0.4421              # N*m*s/rad
+    model_tau_c: 0.2933          # N*m
+    # ---- 原控制器 yaw 增益（与 gimbal_controller 段一致，保证基线可比） ----
+    yaw_kp_angle: 10.0
+    yaw_kp_velocity: 13.0
+    yaw_ki_velocity: 0.02
+    yaw_velocity_integral_limit: 5.0
+value_collector:
+  ros__parameters:
+    csv_path: "/tmp/yaw_id_<timestamp>.csv"
+    signals:
+      # ---- yaw 辨识主信号 ----
+      - /gimbal/yaw/angle              # 电机编码器 yaw（相对底盘，单圈）
+      - /gimbal/yaw/velocity           # 电调反馈角速度
+      - /gimbal/yaw/velocity_imu       # 云台 IMU 角速度
+      - /gimbal/yaw/torque             # 反馈电流换算的等效力矩
+      - /gimbal/yaw/control_torque     # 控制器指令力矩
+      - /gimbal/yaw/control_angle_error
+      - /gimbal/yaw/temperature
+      # ---- pitch 上下文（保持水平的验证） ----
+      - /gimbal/pitch/angle
+      - /gimbal/pitch/velocity
+      - /gimbal/pitch/velocity_imu
+      - /gimbal/pitch/control_torque
+      # ---- 四臂状态（确认松弛、零力矩） ----
+      - /chassis/left_front_joint/physical_angle
+      - /chassis/left_back_joint/physical_angle
+      - /chassis/right_back_joint/physical_angle
+      - /chassis/right_front_joint/physical_angle
+    write_interval: 1                  # 全速率（yaw 命令实际约 500Hz）
+    flush_interval: 1000
+
+value_broadcaster:
+  ros__parameters:
+    forward_list:
+      - /gimbal/yaw/angle
+      - /gimbal/yaw/velocity
+
+deformable_infantry:
+  ros__parameters:
+    serial_filter_bottom_board: "AF-C1C3-DFE8-40A8-FC4B-B853-6ED7-AC9F-1DED"
+    serial_filter_top_board: "AF-ABAC-786D-1B53-99F6-00A2-42A6-AA95-9D69"
+    chassis_radius: 0.2341741
+    rod_length: 0.140
+    yaw_motor_zero_point: 38910
+    pitch_motor_zero_point: 32214
+
+chassis_controller:
+  ros__parameters:
+    min_angle: 8.0
+    max_angle: 59.0
+    active_suspension_enable: true
+    wireless_charging_offset_deg: 135.0
+    wireless_charging_speed_limit: 0.6
+    wireless_charging_angular_velocity_limit: 10.0
+
+gimbal_controller:
+  ros__parameters:
+    upper_limit: -0.60 # -27 deg
+    lower_limit: 0.10 # 8 deg
+    ctrl_hold_pitch_target_angle: 0.0
+
+    yaw_angle_kp: 10.0
+    yaw_angle_ki: 0.0
+    yaw_angle_kd: 0.0
+
+    yaw_velocity_kp: 13.0
+    yaw_velocity_ki: 0.02
+    yaw_velocity_kd: 0.0
+    yaw_velocity_integral_min: -5.0
+    yaw_velocity_integral_max: 5.0
+
+    pitch_angle_kp: 35.0
+    pitch_angle_ki: 0.02
+    pitch_angle_kd: 0.3
+    pitch_angle_integral_min: -0.5
+    pitch_angle_integral_max: 0.5
+
+    pitch_velocity_kp: 2.0
+    pitch_velocity_ki: 0.0
+    pitch_velocity_kd: 0.0
+
+    yaw_ref_velocity_gain: 1.0
+    pitch_ref_velocity_gain: 1.0
+
+    yaw_velocity_ff_gain: 0.13
+    yaw_acceleration_ff_gain: 0.18
+    pitch_velocity_ff_gain: 0.378
+    pitch_acceleration_ff_gain: 0.0396
+
+    pitch_gravity_ff_gain: 2.575
+    pitch_gravity_ff_phase: 1.784
+
+    pitch_torque_control: true
+
+friction_wheel_controller:
+  ros__parameters:
+    friction_wheels:
+      - /gimbal/left_friction
+      - /gimbal/right_friction
+    friction_velocities:
+      - 580.0
+      - 580.0
+    friction_velocities_low_mode:
+      - 530.0
+      - 530.0
+    friction_soft_start_stop_time: 1.0
+
+heat_controller:
+  ros__parameters:
+    heat_per_shot: 10000
+    reserved_heat: 15000
+
+bullet_feeder_controller:
+  ros__parameters:
+    bullets_per_feeder_turn: 8.0
+    shot_frequency: 15.0
+    safe_shot_frequency: 10.0
+    eject_frequency: 10.0
+    eject_time: 0.05
+    deep_eject_frequency: 5.0
+    deep_eject_time: 0.2
+    single_shot_max_stop_delay: 2.0
+
+left_friction_velocity_pid_controller:
+  ros__parameters:
+    measurement: /gimbal/left_friction/velocity
+    setpoint: /gimbal/left_friction/control_velocity
+    control: /gimbal/left_friction/control_torque
+    kp: 0.003436926
+    ki: 0.00
+    kd: 0.009373434
+
+right_friction_velocity_pid_controller:
+  ros__parameters:
+    measurement: /gimbal/right_friction/velocity
+    setpoint: /gimbal/right_friction/control_velocity
+    control: /gimbal/right_friction/control_torque
+    kp: 0.003436926
+    ki: 0.00
+    kd: 0.009373434
+
+bullet_feeder_velocity_pid_controller:
+  ros__parameters:
+    measurement: /gimbal/bullet_feeder/velocity
+    setpoint: /gimbal/bullet_feeder/control_velocity
+    control: /gimbal/bullet_feeder/control_torque
+    kp: 0.9
+    ki: 0.0
+    kd: 0.0

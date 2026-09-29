@@ -78,7 +78,18 @@ public:
 
         const auto trajectory_ff = trajectory_feedforward(auto_aim_active);
 
-        if (!std::isfinite(angle_error.yaw_angle_error)) {
+        // yaw 辨识交接：试验激活时输出激励力矩并复位 yaw PID（防止积分饱和），pitch 路径不受影响
+        const bool yaw_identification_handoff =
+            input_.yaw_identification_active.ready() && *input_.yaw_identification_active
+            && input_.yaw_identification_torque.ready()
+            && std::isfinite(*input_.yaw_identification_torque);
+
+        if (yaw_identification_handoff) {
+            yaw_angle_pid_.reset();
+            yaw_velocity_pid_.reset();
+            *output_.yaw_control_torque = *input_.yaw_identification_torque;
+            *output_.yaw_angle_error = kNaN;
+        } else if (!std::isfinite(angle_error.yaw_angle_error)) {
             yaw_angle_pid_.reset();
             yaw_velocity_pid_.reset();
             *output_.yaw_control_torque = kNaN;
@@ -149,6 +160,10 @@ private:
                 "/auto_aim/control_direction", auto_aim_control_direction, false);
             component.register_input("/auto_aim/ff_v", auto_aim_ff_v, false);
             component.register_input("/auto_aim/ff_a", auto_aim_ff_a, false);
+
+            // yaw 辨识试验交接信号（optional）：激活时本组件的 yaw 输出被替换为激励力矩
+            component.register_input("/gimbal/yaw/identification_active", yaw_identification_active, false);
+            component.register_input("/gimbal/yaw/identification_torque", yaw_identification_torque, false);
         }
 
         InputInterface<Eigen::Vector2d> joystick_left;
@@ -167,6 +182,9 @@ private:
         InputInterface<Eigen::Vector3d> auto_aim_control_direction;
         InputInterface<Eigen::Vector3d> auto_aim_ff_v;
         InputInterface<Eigen::Vector3d> auto_aim_ff_a;
+
+        InputInterface<bool> yaw_identification_active;
+        InputInterface<double> yaw_identification_torque;
     } input_{*this};
 
     struct Output {

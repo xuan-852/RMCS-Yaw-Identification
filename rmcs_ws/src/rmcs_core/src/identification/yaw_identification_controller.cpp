@@ -1,0 +1,782 @@
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <filesystem>
+#include <iomanip>
+#include <limits>
+#include <numbers>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <pluginlib/class_list_macros.hpp>
+#include <rclcpp/logging.hpp>
+#include <rclcpp/node.hpp>
+#include <rmcs_executor/component.hpp>
+#include <rmcs_msgs/switch.hpp>
+#include <rmcs_utility/csv_writer.hpp>
+
+namespace rmcs_core::controller::identification {
+
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+template <typename T>
+T parameter_or_declare(rclcpp::Node& node, const std::string& name, const T& default_value) {
+    if (!node.has_parameter(name))
+        node.declare_parameter<T>(name, default_value);
+    return node.get_parameter(name).get_value<T>();
+}
+
+std::string timestamped_filename(const std::string& prefix) {
+    const auto now = std::chrono::system_clock::now();
+    const auto time = std::chrono::system_clock::to_time_t(now);
+    const auto milliseconds =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+    std::ostringstream ss;
+    // 带毫秒：避免同一秒内重复触发同一工况时覆盖已有 CSV
+    ss << prefix << "_" << std::put_time(std::localtime(&time), "%Y-%m-%d_%H-%M-%S") << "-"
+       << std::setw(3) << std::setfill('0') << milliseconds << ".csv";
+    return ss.str();
+}
+
+double smootherstep(double u) {
+    u = std::clamp(u, 0.0, 1.0);
+    return u * u * u * (u * (6.0 * u - 15.0) + 10.0);
+}
+
+std::string trim(const std::string& text) {
+    const auto begin = text.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos)
+        return {};
+    const auto end = text.find_last_not_of(" \t\r\n");
+    return text.substr(begin, end - begin + 1);
+}
+
+/// 工况类型。序号同时写入 CSV 的 phase 列，沿用历史语义：
+///   0 static（静置，零偏）  1 sine（正弦）  2 step（正负交替阶跃）  3 track（闭环跟踪 A/B）
+enum class ConditionType : int { kStatic = 0, kSine = 1, kStep = 2, kTrack = 3 };
+
+const char* condition_type_name(ConditionType type) {
+    switch (type) {
+    case ConditionType::kStatic: return "static";
+    case ConditionType::kSine: return "sine";
+    case ConditionType::kStep: return "step";
+    case ConditionType::kTrack: return "track";
+    }
+    return "unknown";
+}
+
+struct Condition {
+    int id = 0;
+    ConditionType type = ConditionType::kStatic;
+    double amplitude = 0.0;   // N*m，sine / step
+    double frequency = 0.0;   // Hz，sine
+    double duration = 0.0;    // s，全部类型
+    double step_hold = 0.0;   // s，step 每拍时长
+    int step_count = 0;       // step 拍数
+    std::string control_mode; // track: "baseline" | "model"
+};
+
+} // namespace
+
+/// yaw 辨识与 A/B 对照协议控制器。
+///
+/// 两种工作模式：
+///
+/// 【1】传统模式（`condition_schedule` 为空）——行为与历史版本完全一致：
+///   一次触发跑完整条 4 段协议，写单个 CSV：
+///     phase 0 静置 static_duration_s
+///     phase 1 正弦 sine_duration_s（幅值 sine_amplitude，频率 sine_frequency_hz）
+///     phase 2 阶跃 step_count 拍 × step_duration_s（幅值 step_amplitude，正负交替）
+///     phase 3 跟踪 track_duration_s（±track_step_angle_deg + track_sine_*）
+///
+/// 【2】扫描模式（`condition_schedule` 非空）——一次触发只跑列表里的**下一条**工况，
+///   每条工况写**独立的 CSV**，跑完自动关闭；列表耗尽后不再启动。
+///   触发手势不变：左拨杆 MIDDLE + 右拨杆 MIDDLE -> UP 的上升沿。
+///   每次触发后必须把右拨杆拨回 MIDDLE，否则下一次不会触发。
+///
+/// `condition_schedule` 语法：一行一条工况，`#` 之后为注释，字段 `key=value`：
+///     static dur=15
+///     sine   amp=1.0 freq=0.20 dur=20
+///     step   amp=2.0 hold=0.5 count=10        （dur 可省略，自动 = hold*count）
+///     track  mode=baseline dur=20
+///   必填：static/sine/track 需要 dur；sine 还需 amp+freq；step 需要 amp+hold+count；track 还需 mode。
+///   可选：id=（默认按行号 1..N）。
+///   任何语法/取值错误都会在**组件启动时**抛异常（快速失败，避免上车才发现）。
+///
+/// 安全：激励力矩硬限幅 torque_limit（track 段用 track_torque_limit），
+/// |IMU 角速度| > abort_velocity 或遥控失效（含双下）自动中止并保留已写数据。
+class YawIdentificationController
+    : public rmcs_executor::Component
+    , public rclcpp::Node {
+public:
+    YawIdentificationController()
+        : Node(
+              get_component_name(),
+              rclcpp::NodeOptions{}.automatically_declare_parameters_from_overrides(true))
+        , static_duration_s_(parameter_or_declare(*this, "static_duration_s", 15.0))
+        , sine_duration_s_(parameter_or_declare(*this, "sine_duration_s", 30.0))
+        , sine_amplitude_(parameter_or_declare(*this, "sine_amplitude", 1.0))
+        , sine_frequency_hz_(parameter_or_declare(*this, "sine_frequency_hz", 1.0))
+        , step_amplitude_(parameter_or_declare(*this, "step_amplitude", 0.8))
+        , step_duration_s_(parameter_or_declare(*this, "step_duration_s", 0.5))
+        , step_count_(parameter_or_declare(*this, "step_count", 10))
+        , torque_limit_(parameter_or_declare(*this, "torque_limit", 1.5))
+        , abort_velocity_(parameter_or_declare(*this, "abort_velocity", 6.0))
+        , csv_directory_(parameter_or_declare(*this, "csv_directory", std::string{"/tmp"}))
+        , track_duration_s_(parameter_or_declare(*this, "track_duration_s", 20.0))
+        , track_step_angle_rad_(
+              parameter_or_declare(*this, "track_step_angle_deg", 30.0) * std::numbers::pi_v<double> / 180.0)
+        , track_step_hold_s_(parameter_or_declare(*this, "track_step_hold_s", 2.5))
+        , track_sine_amplitude_rad_(
+              parameter_or_declare(*this, "track_sine_amplitude_deg", 30.0) * std::numbers::pi_v<double> / 180.0)
+        , track_sine_frequency_hz_(parameter_or_declare(*this, "track_sine_frequency_hz", 0.5))
+        , track_transition_s_(parameter_or_declare(*this, "track_transition_s", 0.3))
+        , track_torque_limit_(parameter_or_declare(*this, "track_torque_limit", 4.0))
+        , control_mode_(parameter_or_declare(*this, "control_mode", std::string{"baseline"}))
+        , model_J_(parameter_or_declare(*this, "model_J", 0.1503))
+        , model_B_(parameter_or_declare(*this, "model_B", 0.6605))
+        , model_tau_c_(parameter_or_declare(*this, "model_tau_c", 0.201))
+        , yaw_kp_angle_(parameter_or_declare(*this, "yaw_kp_angle", 10.0))
+        , yaw_kp_velocity_(parameter_or_declare(*this, "yaw_kp_velocity", 13.0))
+        , yaw_ki_velocity_(parameter_or_declare(*this, "yaw_ki_velocity", 0.02))
+        , yaw_velocity_integral_limit_(
+              parameter_or_declare(*this, "yaw_velocity_integral_limit", 5.0)) {
+        if (static_duration_s_ <= 0.0 || sine_duration_s_ <= 0.0 || step_duration_s_ <= 0.0
+            || track_duration_s_ <= 0.0 || track_step_hold_s_ <= 0.0 || track_transition_s_ <= 0.0)
+            throw std::runtime_error("durations must be positive");
+        if (sine_frequency_hz_ <= 0.0 || track_sine_frequency_hz_ <= 0.0)
+            throw std::runtime_error("frequencies must be positive");
+        if (step_count_ < 1)
+            throw std::runtime_error("step_count must be >= 1");
+        if (!std::isfinite(sine_amplitude_) || !std::isfinite(step_amplitude_)
+            || std::min(sine_amplitude_, step_amplitude_) < 0.0)
+            throw std::runtime_error("amplitudes must be finite and non-negative");
+        if (!std::isfinite(torque_limit_)
+            || torque_limit_ < std::max(sine_amplitude_, step_amplitude_))
+            throw std::runtime_error("torque_limit must be >= excitation amplitudes");
+        if (control_mode_ != "baseline" && control_mode_ != "model")
+            throw std::runtime_error("control_mode must be 'baseline' or 'model'");
+        if (track_torque_limit_ < torque_limit_)
+            throw std::runtime_error("track_torque_limit must be >= torque_limit");
+
+        const auto schedule_text = parameter_or_declare(*this, "condition_schedule", std::string{});
+        if (trim(schedule_text).empty()) {
+            legacy_mode_ = true;
+            schedule_ = legacy_schedule();
+        } else {
+            legacy_mode_ = false;
+            schedule_ = parse_schedule(schedule_text);
+        }
+        validate_schedule();
+
+        register_input("/predefined/timestamp", timestamp_);
+        register_input("/remote/switch/left", switch_left_);
+        register_input("/remote/switch/right", switch_right_);
+
+        register_input("/gimbal/yaw/velocity_imu", yaw_velocity_imu_);
+        register_input("/gimbal/yaw/velocity", yaw_velocity_);
+        register_input("/gimbal/yaw/torque", yaw_torque_);
+        register_input("/gimbal/yaw/angle", yaw_angle_);
+        register_input("/gimbal/yaw/temperature", yaw_temperature_);
+        register_input("/gimbal/pitch/angle", pitch_angle_);
+        register_input("/gimbal/yaw/control_torque", yaw_control_torque_);
+
+        register_output("/gimbal/yaw/identification_torque", identification_torque_, nan_);
+        register_output("/gimbal/yaw/identification_active", identification_active_, false);
+
+        if (legacy_mode_) {
+            RCLCPP_INFO(
+                get_logger(),
+                "Yaw identification: legacy mode (single trigger runs the full %zu-condition "
+                "protocol), log dir=%s",
+                schedule_.size(), csv_directory_.c_str());
+        } else {
+            RCLCPP_INFO(
+                get_logger(),
+                "Yaw identification: sweep mode, %zu conditions queued, log dir=%s "
+                "(gesture: left=MIDDLE, right MIDDLE->UP; return right to MIDDLE after each run)",
+                schedule_.size(), csv_directory_.c_str());
+        }
+        for (std::size_t i = 0; i < schedule_.size(); ++i) {
+            const auto& condition = schedule_[i];
+            RCLCPP_INFO(
+                get_logger(),
+                "  [%2zu/%zu] id=%d %-6s amp=%.2f freq=%.3f dur=%.1f hold=%.2f count=%d mode=%s",
+                i + 1, schedule_.size(), condition.id, condition_type_name(condition.type),
+                condition.amplitude, condition.frequency, condition.duration, condition.step_hold,
+                condition.step_count,
+                condition.control_mode.empty() ? "-" : condition.control_mode.c_str());
+        }
+    }
+
+    ~YawIdentificationController() override { finish_test("destructor"); }
+
+    void before_updating() override {
+        finish_test("restart");
+        *identification_torque_ = nan_;
+        *identification_active_ = false;
+        last_switch_left_ = rmcs_msgs::Switch::UNKNOWN;
+        last_switch_right_ = rmcs_msgs::Switch::UNKNOWN;
+        next_condition_ = 0;
+        // 可选输入：若上游没有发布者（例如云台控制器被移除），绑到 NaN，避免解引用空引用
+        if (!yaw_control_torque_.ready())
+            yaw_control_torque_.bind_directly(nan_);
+    }
+
+    void update() override {
+        const auto current_switch_left = *switch_left_;
+        const auto current_switch_right = *switch_right_;
+
+        const bool remote_enabled =
+            !(current_switch_left == rmcs_msgs::Switch::UNKNOWN
+              || current_switch_right == rmcs_msgs::Switch::UNKNOWN
+              || (current_switch_left == rmcs_msgs::Switch::DOWN
+                  && current_switch_right == rmcs_msgs::Switch::DOWN));
+
+        if (!remote_enabled) {
+            abort_test("remote disabled");
+            *identification_torque_ = nan_;
+            *identification_active_ = false;
+            store_switch_state(current_switch_left, current_switch_right);
+            return;
+        }
+
+        if (phase_ == Phase::kIdle) {
+            if (should_start_test(current_switch_left, current_switch_right)) {
+                if (legacy_mode_)
+                    next_condition_ = 0; // 传统模式：一次触发跑完 4 段
+                if (next_condition_ >= schedule_.size()) {
+                    // 扫描跑完后再拨一次 = 从第 1 条重来（用于补采 / 加热循环），CSV 各自独立不会覆盖
+                    RCLCPP_WARN(
+                        get_logger(),
+                        "Yaw identification: sweep already finished (%zu/%zu); restarting from "
+                        "condition 1.",
+                        next_condition_, schedule_.size());
+                    next_condition_ = 0;
+                }
+                start_test(next_condition_);
+            }
+            if (phase_ == Phase::kIdle) {
+                *identification_torque_ = nan_;
+                *identification_active_ = false;
+                store_switch_state(current_switch_left, current_switch_right);
+                return;
+            }
+        }
+
+        const double elapsed_s =
+            std::chrono::duration<double>(*timestamp_ - test_start_time_).count();
+
+        update_continuous_angle();
+
+        const Condition& condition = schedule_[current_condition_];
+        const double local_s = elapsed_s - condition_start_elapsed_s_;
+
+        double excitation = 0.0;
+        double ff_torque = nan_;
+        double ref_angle = nan_;
+        double ref_velocity = nan_;
+        double ref_acceleration = nan_;
+        bool condition_finished = false;
+
+        switch (condition.type) {
+        case ConditionType::kStatic:
+            if (local_s >= condition.duration)
+                condition_finished = true;
+            break;
+
+        case ConditionType::kSine:
+            if (local_s >= condition.duration) {
+                condition_finished = true;
+            } else {
+                excitation = condition.amplitude
+                           * std::sin(
+                               2.0 * std::numbers::pi_v<double> * condition.frequency * local_s);
+            }
+            break;
+
+        case ConditionType::kStep: {
+            const auto step_index = static_cast<int>(local_s / condition.step_hold);
+            if (step_index >= condition.step_count) {
+                condition_finished = true;
+            } else {
+                excitation = (step_index % 2 == 0) ? condition.amplitude : -condition.amplitude;
+            }
+            break;
+        }
+
+        case ConditionType::kTrack: {
+            if (local_s >= condition.duration) {
+                condition_finished = true;
+                break;
+            }
+            if (!tracking_initialized_) {
+                tracking_initialized_ = true;
+                track_ref_origin_ = continuous_angle_;
+                reference_angle_ = track_ref_origin_;
+                reference_velocity_ = 0.0;
+                previous_velocity_ref_ = 0.0;
+                velocity_integrator_ = 0.0;
+            }
+            update_tracking_reference(local_s);
+            const double dt = std::max(update_dt(), 1e-6);
+            ref_acceleration = (reference_velocity_ - previous_velocity_ref_) / dt;
+            previous_velocity_ref_ = reference_velocity_;
+
+            const double angle_error = reference_angle_ - continuous_angle_;
+            const double velocity_error = reference_velocity_ - *yaw_velocity_imu_;
+
+            // 复刻原控制器：级联 PID，速度积分按原 PidCalculator 语义直接累加误差（不乘 dt）
+            velocity_integrator_ = std::clamp(
+                velocity_integrator_ + velocity_error, -yaw_velocity_integral_limit_,
+                yaw_velocity_integral_limit_);
+            double torque = yaw_kp_velocity_ * (yaw_kp_angle_ * angle_error + velocity_error)
+                          + yaw_ki_velocity_ * velocity_integrator_;
+
+            if (condition.control_mode == "model") {
+                ff_torque = model_J_ * ref_acceleration + model_B_ * reference_velocity_
+                          + model_tau_c_ * ((reference_velocity_ >= 0.0) ? 1.0 : -1.0);
+                torque += ff_torque;
+            }
+
+            torque = std::clamp(torque, -track_torque_limit_, track_torque_limit_);
+            excitation = torque;
+            ref_angle = reference_angle_;
+            ref_velocity = reference_velocity_;
+            break;
+        }
+        }
+
+        if (condition_finished) {
+            *identification_torque_ = nan_;
+            *identification_active_ = false;
+            if (current_condition_ + 1 < schedule_.size() && legacy_mode_) {
+                // 传统模式：同一条 CSV 内推进到下一段
+                current_condition_ += 1;
+                condition_start_elapsed_s_ = elapsed_s;
+                tracking_initialized_ = false;
+                velocity_integrator_ = 0.0;
+                previous_velocity_ref_ = 0.0;
+            } else {
+                if (!legacy_mode_)
+                    next_condition_ = current_condition_ + 1;
+                RCLCPP_INFO(
+                    get_logger(), "Yaw identification: condition id=%d (%s) finished at %.2fs",
+                    condition.id, condition_type_name(condition.type), elapsed_s);
+                finish_test("condition finished");
+            }
+            store_switch_state(current_switch_left, current_switch_right);
+            return;
+        }
+
+        const double limit =
+            (condition.type == ConditionType::kTrack) ? track_torque_limit_ : torque_limit_;
+        excitation = std::clamp(excitation, -limit, limit);
+        *identification_torque_ = excitation;
+        *identification_active_ = true;
+
+        if (std::abs(*yaw_velocity_imu_) > abort_velocity_) {
+            log_sample(
+                elapsed_s, local_s, condition, excitation, ff_torque, ref_angle, ref_velocity,
+                ref_acceleration);
+            abort_test("imu velocity over limit");
+            *identification_torque_ = nan_;
+            *identification_active_ = false;
+            store_switch_state(current_switch_left, current_switch_right);
+            return;
+        }
+
+        log_sample(
+            elapsed_s, local_s, condition, excitation, ff_torque, ref_angle, ref_velocity,
+            ref_acceleration);
+
+        store_switch_state(current_switch_left, current_switch_right);
+    }
+
+private:
+    static constexpr double nan_ = std::numeric_limits<double>::quiet_NaN();
+    static constexpr auto kFlushInterval = std::chrono::duration<double>(0.1);
+
+    enum class Phase { kIdle, kRunning };
+
+    /// 传统模式的 4 段协议（与历史版本逐位一致）
+    std::vector<Condition> legacy_schedule() const {
+        std::vector<Condition> schedule;
+        schedule.push_back(Condition{
+            1, ConditionType::kStatic, 0.0, 0.0, static_duration_s_, 0.0, 0, {}});
+        schedule.push_back(Condition{
+            2, ConditionType::kSine, sine_amplitude_, sine_frequency_hz_, sine_duration_s_, 0.0, 0,
+            {}});
+        schedule.push_back(Condition{
+            3, ConditionType::kStep, step_amplitude_, 0.0, step_duration_s_ * step_count_,
+            step_duration_s_, step_count_, {}});
+        schedule.push_back(Condition{
+            4, ConditionType::kTrack, 0.0, 0.0, track_duration_s_, 0.0, 0, control_mode_});
+        return schedule;
+    }
+
+    /// 解析 condition_schedule 文本；任何错误直接抛异常
+    std::vector<Condition> parse_schedule(const std::string& text) const {
+        std::vector<Condition> schedule;
+        std::istringstream stream{text};
+        std::string line;
+        int line_number = 0;
+        while (std::getline(stream, line)) {
+            ++line_number;
+            const auto comment = line.find('#');
+            if (comment != std::string::npos)
+                line = line.substr(0, comment);
+            line = trim(line);
+            if (line.empty())
+                continue;
+
+            std::istringstream tokens{line};
+            std::string type_token;
+            tokens >> type_token;
+
+            Condition condition;
+            condition.id = static_cast<int>(schedule.size()) + 1;
+            if (type_token == "static")
+                condition.type = ConditionType::kStatic;
+            else if (type_token == "sine")
+                condition.type = ConditionType::kSine;
+            else if (type_token == "step")
+                condition.type = ConditionType::kStep;
+            else if (type_token == "track")
+                condition.type = ConditionType::kTrack;
+            else
+                throw std::runtime_error(
+                    "condition_schedule line " + std::to_string(line_number)
+                    + ": unknown type '" + type_token
+                    + "' (expected static|sine|step|track)");
+
+            std::string token;
+            while (tokens >> token) {
+                const auto equals = token.find('=');
+                if (equals == std::string::npos)
+                    throw std::runtime_error(
+                        "condition_schedule line " + std::to_string(line_number)
+                        + ": expected key=value, got '" + token + "'");
+                const auto key = token.substr(0, equals);
+                const auto value = token.substr(equals + 1);
+                auto to_double = [&]() {
+                    try {
+                        std::size_t consumed = 0;
+                        const double parsed = std::stod(value, &consumed);
+                        if (consumed != value.size())
+                            throw std::invalid_argument("trailing characters");
+                        return parsed;
+                    } catch (const std::exception&) {
+                        throw std::runtime_error(
+                            "condition_schedule line " + std::to_string(line_number) + ": bad value '"
+                            + value + "' for key '" + key + "'");
+                    }
+                };
+
+                if (key == "id")
+                    condition.id = static_cast<int>(to_double());
+                else if (key == "amp" || key == "amplitude")
+                    condition.amplitude = to_double();
+                else if (key == "freq" || key == "frequency_hz")
+                    condition.frequency = to_double();
+                else if (key == "dur" || key == "duration_s")
+                    condition.duration = to_double();
+                else if (key == "hold" || key == "step_duration_s")
+                    condition.step_hold = to_double();
+                else if (key == "count" || key == "step_count")
+                    condition.step_count = static_cast<int>(to_double());
+                else if (key == "mode" || key == "control_mode")
+                    condition.control_mode = value;
+                else
+                    throw std::runtime_error(
+                        "condition_schedule line " + std::to_string(line_number)
+                        + ": unknown key '" + key + "'");
+            }
+
+            if (condition.type == ConditionType::kStep) {
+                if (!(condition.amplitude > 0.0))
+                    throw std::runtime_error(
+                        "condition_schedule line " + std::to_string(line_number)
+                        + ": step requires amp>0");
+                if (!(condition.step_hold > 0.0))
+                    throw std::runtime_error(
+                        "condition_schedule line " + std::to_string(line_number)
+                        + ": step requires hold>0");
+                if (condition.step_count < 1)
+                    throw std::runtime_error(
+                        "condition_schedule line " + std::to_string(line_number)
+                        + ": step requires count>=1");
+                // step 的 dur 可省略：由 hold * count 推出（避免两处写法互相矛盾）
+                if (!(condition.duration > 0.0))
+                    condition.duration =
+                        condition.step_hold * static_cast<double>(condition.step_count);
+            } else if (!(condition.duration > 0.0)) {
+                throw std::runtime_error(
+                    "condition_schedule line " + std::to_string(line_number)
+                    + ": 'dur' must be > 0");
+            }
+            if (condition.type == ConditionType::kSine
+                && (!(condition.amplitude > 0.0) || !(condition.frequency > 0.0)))
+                throw std::runtime_error(
+                    "condition_schedule line " + std::to_string(line_number)
+                    + ": sine requires amp>0 and freq>0");
+            if (condition.type == ConditionType::kTrack
+                && condition.control_mode != "baseline" && condition.control_mode != "model")
+                throw std::runtime_error(
+                    "condition_schedule line " + std::to_string(line_number)
+                    + ": track requires mode=baseline|model");
+
+            schedule.push_back(condition);
+        }
+
+        if (schedule.empty())
+            throw std::runtime_error("condition_schedule is not empty but contains no conditions");
+        return schedule;
+    }
+
+    /// 逐条校验幅值不超过硬限幅——宁可启动就报错，也不要上车后静默削顶
+    void validate_schedule() const {
+        for (const auto& condition : schedule_) {
+            if (condition.type == ConditionType::kStatic)
+                continue;
+            const double limit =
+                (condition.type == ConditionType::kTrack) ? track_torque_limit_ : torque_limit_;
+            if (condition.amplitude > limit)
+                throw std::runtime_error(
+                    "condition id=" + std::to_string(condition.id) + " ("
+                    + condition_type_name(condition.type) + ") amplitude "
+                    + std::to_string(condition.amplitude)
+                    + " exceeds the configured limit " + std::to_string(limit)
+                    + " — raise torque_limit/track_torque_limit or lower the amplitude");
+        }
+    }
+
+    void update_continuous_angle() {
+        const double raw = *yaw_angle_;
+        if (!angle_initialized_) {
+            continuous_angle_ = raw;
+            previous_raw_angle_ = raw;
+            angle_initialized_ = true;
+            return;
+        }
+        continuous_angle_ += std::remainder(raw - previous_raw_angle_, 2.0 * std::numbers::pi_v<double>);
+        previous_raw_angle_ = raw;
+    }
+
+    void update_tracking_reference(double local_s) {
+        const double step_phase_s = 4.0 * track_step_hold_s_;
+        constexpr double kTargets[4] = {1.0, -1.0, 1.0, 0.0};
+
+        if (local_s < step_phase_s) {
+            const auto seg = static_cast<int>(local_s / track_step_hold_s_);
+            const double seg_start = static_cast<double>(seg) * track_step_hold_s_;
+            const double u = smootherstep((local_s - seg_start) / track_transition_s_);
+            const double prev = (seg == 0) ? 0.0 : kTargets[seg - 1];
+            reference_offset_ =
+                (prev + (kTargets[seg] - prev) * u) * track_step_angle_rad_;
+        } else {
+            const double local_sine = local_s - step_phase_s;
+            reference_offset_ = track_sine_amplitude_rad_
+                              * std::sin(2.0 * std::numbers::pi_v<double> * track_sine_frequency_hz_
+                                         * local_sine);
+        }
+
+        const double new_ref = track_ref_origin_ + reference_offset_;
+        const double dt = std::max(update_dt(), 1e-6);
+        reference_velocity_ = (new_ref - reference_angle_) / dt;
+        reference_angle_ = new_ref;
+    }
+
+    bool should_start_test(
+        rmcs_msgs::Switch current_switch_left, rmcs_msgs::Switch current_switch_right) const {
+        using rmcs_msgs::Switch;
+        return last_switch_left_ == Switch::MIDDLE && last_switch_right_ == Switch::MIDDLE
+            && current_switch_left == Switch::MIDDLE && current_switch_right == Switch::UP;
+    }
+
+    void start_test(std::size_t condition_index) {
+        current_condition_ = condition_index;
+        const Condition& condition = schedule_[current_condition_];
+
+        std::ostringstream prefix;
+        prefix << "yaw";
+        if (legacy_mode_) {
+            prefix << "_identification";
+        } else {
+            prefix << "_c" << std::setw(2) << std::setfill('0') << condition.id << "_"
+                   << condition_type_name(condition.type);
+        }
+        const auto path = std::filesystem::path{csv_directory_} / timestamped_filename(prefix.str());
+
+        try {
+            csv_writer_.open(path);
+        } catch (const std::exception& exception) {
+            RCLCPP_ERROR(
+                get_logger(), "Failed to open identification log '%s': %s", path.string().c_str(),
+                exception.what());
+            return;
+        }
+        try {
+            csv_writer_.write_row(
+                "elapsed_s", "phase", "excitation_torque", "ff_torque", "reference_angle",
+                "reference_velocity", "reference_acceleration", "measured_torque",
+                "measured_velocity", "measured_velocity_imu", "measured_angle", "pitch_angle",
+                "temperature", "condition_id", "condition_type", "condition_elapsed_s",
+                "wallclock_s", "control_torque");
+            csv_writer_.flush();
+        } catch (const std::exception& exception) {
+            RCLCPP_ERROR(get_logger(), "Failed to write identification log header: %s", exception.what());
+            csv_writer_.close();
+            return;
+        }
+
+        test_start_time_ = *timestamp_;
+        test_start_wallclock_s_ = std::chrono::duration<double>(
+                                      std::chrono::system_clock::now().time_since_epoch())
+                                      .count();
+        next_flush_time_ =
+            test_start_time_ + std::chrono::duration_cast<Clock::duration>(kFlushInterval);
+        phase_ = Phase::kRunning;
+        condition_start_elapsed_s_ = 0.0;
+        tracking_initialized_ = false;
+        angle_initialized_ = false;
+        reference_angle_ = 0.0;
+        reference_velocity_ = 0.0;
+        previous_velocity_ref_ = 0.0;
+        velocity_integrator_ = 0.0;
+        *identification_active_ = true;
+        RCLCPP_INFO(
+            get_logger(), "Yaw identification: condition %zu/%zu started (id=%d %s mode=%s), log=%s",
+            condition_index + 1, schedule_.size(), condition.id,
+            condition_type_name(condition.type),
+            condition.control_mode.empty() ? "-" : condition.control_mode.c_str(),
+            path.string().c_str());
+    }
+
+    void log_sample(
+        double elapsed_s, double local_s, const Condition& condition, double excitation,
+        double ff_torque, double ref_angle, double ref_velocity, double ref_acceleration) {
+        if (phase_ != Phase::kRunning || !csv_writer_.is_open())
+            return;
+        try {
+            csv_writer_.write_row(
+                elapsed_s, static_cast<int>(condition.type), excitation, ff_torque, ref_angle,
+                ref_velocity, ref_acceleration, *yaw_torque_, *yaw_velocity_, *yaw_velocity_imu_,
+                *yaw_angle_, *pitch_angle_, *yaw_temperature_, condition.id,
+                condition_type_name(condition.type), local_s, test_start_wallclock_s_ + elapsed_s,
+                *yaw_control_torque_);
+        } catch (const std::exception& exception) {
+            RCLCPP_ERROR(get_logger(), "Failed to write identification sample: %s", exception.what());
+        }
+        if (*timestamp_ >= next_flush_time_) {
+            csv_writer_.flush();
+            while (*timestamp_ >= next_flush_time_)
+                next_flush_time_ += std::chrono::duration_cast<Clock::duration>(kFlushInterval);
+        }
+    }
+
+    void finish_test(const char* reason) {
+        if (phase_ != Phase::kRunning)
+            return;
+        phase_ = Phase::kIdle;
+        *identification_active_ = false;
+        *identification_torque_ = nan_;
+        if (csv_writer_.is_open()) {
+            csv_writer_.flush();
+            csv_writer_.close();
+            RCLCPP_INFO(get_logger(), "Yaw identification test finished (%s), log=%s", reason,
+                        csv_writer_.path().string().c_str());
+        }
+    }
+
+    void abort_test(const char* reason) { finish_test(reason); }
+
+    void store_switch_state(
+        rmcs_msgs::Switch current_switch_left, rmcs_msgs::Switch current_switch_right) {
+        last_switch_left_ = current_switch_left;
+        last_switch_right_ = current_switch_right;
+    }
+
+    double update_dt() const { return 0.001; }
+
+    const double static_duration_s_;
+    const double sine_duration_s_;
+    const double sine_amplitude_;
+    const double sine_frequency_hz_;
+    const double step_amplitude_;
+    const double step_duration_s_;
+    const int step_count_;
+    const double torque_limit_;
+    const double abort_velocity_;
+    const std::string csv_directory_;
+
+    const double track_duration_s_;
+    const double track_step_angle_rad_;
+    const double track_step_hold_s_;
+    const double track_sine_amplitude_rad_;
+    const double track_sine_frequency_hz_;
+    const double track_transition_s_;
+    const double track_torque_limit_;
+    const std::string control_mode_;
+    const double model_J_;
+    const double model_B_;
+    const double model_tau_c_;
+    const double yaw_kp_angle_;
+    const double yaw_kp_velocity_;
+    const double yaw_ki_velocity_;
+    const double yaw_velocity_integral_limit_;
+
+    std::vector<Condition> schedule_;
+    bool legacy_mode_ = true;
+    std::size_t next_condition_ = 0;
+    std::size_t current_condition_ = 0;
+    double condition_start_elapsed_s_ = 0.0;
+
+    Phase phase_ = Phase::kIdle;
+    Clock::time_point test_start_time_{};
+    Clock::time_point next_flush_time_{};
+    double test_start_wallclock_s_ = 0.0;
+
+    bool angle_initialized_ = false;
+    double continuous_angle_ = 0.0;
+    double previous_raw_angle_ = 0.0;
+
+    bool tracking_initialized_ = false;
+    double track_ref_origin_ = 0.0;
+    double reference_offset_ = 0.0;
+    double reference_angle_ = 0.0;
+    double reference_velocity_ = 0.0;
+    double previous_velocity_ref_ = 0.0;
+    double velocity_integrator_ = 0.0;
+
+    rmcs_msgs::Switch last_switch_left_ = rmcs_msgs::Switch::UNKNOWN;
+    rmcs_msgs::Switch last_switch_right_ = rmcs_msgs::Switch::UNKNOWN;
+
+    InputInterface<Clock::time_point> timestamp_;
+    InputInterface<rmcs_msgs::Switch> switch_left_;
+    InputInterface<rmcs_msgs::Switch> switch_right_;
+
+    InputInterface<double> yaw_velocity_imu_;
+    InputInterface<double> yaw_velocity_;
+    InputInterface<double> yaw_torque_;
+    InputInterface<double> yaw_angle_;
+    InputInterface<double> yaw_temperature_;
+    InputInterface<double> pitch_angle_;
+    InputInterface<double> yaw_control_torque_;
+
+    OutputInterface<double> identification_torque_;
+    OutputInterface<bool> identification_active_;
+
+    rmcs_utility::CsvWriter csv_writer_;
+};
+
+} // namespace rmcs_core::controller::identification
+
+PLUGINLIB_EXPORT_CLASS(
+    rmcs_core::controller::identification::YawIdentificationController,
+    rmcs_executor::Component)
