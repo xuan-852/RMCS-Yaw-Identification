@@ -84,45 +84,76 @@ yaw_identification_controller:
     #   track  mode=baseline dur=20
     # 任何语法/取值错误都会在【组件启动时】抛异常并打印行号（不会上车后才发现）
     condition_schedule: |
-      # ---------- 1. 静置：陀螺零偏 + 噪声底 ----------
+      # ================= 一、基础段 =================
+      # 1. 静置：陀螺零偏 + 噪声底
       static dur=15
-      # ---------- 2-6. 频率扫描（1.0 N*m）：分离 J 与 B，系统拐点 ≈0.474 Hz ----------
+
+      # ================= 二、频率扫描（1.0 N*m）：分离 J 与 B，系统拐点 ≈0.474 Hz =================
+      # 3-7. 0.2 → 2.0 Hz。
+      # ⚠️ 已删除 0.05 / 0.10 Hz 两条：准静态响应会让 yaw 朝一个方向持续转出约 0.8 圈
+      #    （0.05 Hz @ 1 N*m 时 ω≈1.6 rad/s 持续 10 s），实测会拉紧线缆 / 产生机械干涉，
+      #    结果是把 pitch 拽到机械下限(-10°)并把 yaw 一起卡死。低频信息改由 track 段提供。
       sine   amp=1.0 freq=0.20 dur=20
       sine   amp=1.0 freq=0.30 dur=20
       sine   amp=1.0 freq=0.50 dur=20
       sine   amp=1.0 freq=1.00 dur=20
       sine   amp=1.0 freq=2.00 dur=20
-      # ---------- 7-10. 幅值扫描（0.5 Hz）：把 |w| 推到 3~6 rad/s，让 B*w 压过 tau_c ----------
+
+      # ================= 三、幅值扫描：摩擦主导 → 阻尼主导 =================
+      # ⚠️ 偏转量约束：准静态下 yaw 偏转 ≈ (τ-τc)/B / (2πf)，与 1/f 成正比，
+      #    而峰值角速度 ω=(τ-τc)/B 与 f 无关。因此【高扭矩条目一律放在 1.0 Hz】：
+      #    既能拿到同样的 ω 峰值（数据质量不变），偏转量又只有 0.5 Hz 时的一半。
+      #    实测 2.5 N*m @0.5Hz 偏转 1.6 rad 会触发 1.8 rad 行程保护，故下移到 1.0 Hz。
+      #
+      # 9-11. 0.5 Hz 扫描（偏转 ≤0.88 rad）：小扭矩、低速段
+      sine   amp=0.3 freq=0.50 dur=25    # 位于 tau_c≈0.29 以下（breakaway 边界）
+      sine   amp=0.6 freq=0.50 dur=25
       sine   amp=1.5 freq=0.50 dur=20
-      sine   amp=2.5 freq=0.50 dur=20
-      sine   amp=3.5 freq=0.50 dur=20
-      sine   amp=4.0 freq=0.50 dur=20
-      # ---------- 11. 高速段（3.0 N*m @ 0.3 Hz，|w| 峰值 ≈5 rad/s，阻尼主导）----------
-      sine   amp=3.0 freq=0.30 dur=20
-      # ---------- 12-13. 低速摩擦曲线（0.1 Hz 准静态，含 breakaway 边界）----------
+      #
+      # 12-17. 1.0 Hz 扫描（偏转 ≤1.34 rad，ω_peak 最高 8.4 rad/s）：高扭矩段
+      sine   amp=0.3 freq=1.00 dur=20
+      sine   amp=0.6 freq=1.00 dur=20
+      sine   amp=1.5 freq=1.00 dur=20
+      sine   amp=2.5 freq=1.00 dur=20
+      # ⚠️ 原设计的 3.5 N*m / 4.0 N*m 已删除。实测依据（2026-09-29 12:51 那条 3.5 N*m）：
+      #   yaw 激励 3.5 N*m 时角加速度 α=(3.5-0.29)/J≈22 rad/s²，产生的惯性扰动超过
+      #   pitch 的力矩余量（保持炮管需 3.5 N*m、电机上限 4.5 N*m，余量仅约 1 N*m），
+      #   实测 pitch 世界角从 +0.08° 被撞到 -8.90°（yaw 速度峰值 4.51 rad/s 时掉得最快）；
+      #   而 ≤2.5 N*m（α≤15 rad/s²）时 pitch 全程稳定 —— 这是本平台的硬约束。
+      # 高扭矩+高速度改由【提高频率】获得：ω_peak=(τ-τc)/B 与频率无关、偏转 ∝ 1/f，
+      # 所以 2.5 N*m 在 1.5/2.0 Hz 同样能到 ω=5.0 rad/s，而偏转只有 0.90/0.68 rad。
+      sine   amp=2.5 freq=1.50 dur=20
+      sine   amp=2.5 freq=2.00 dur=20
+
+      # ================= 五、低速摩擦曲线（准静态）=================
+      # 17-18. 0.1 Hz 慢速，含 breakaway 边界
       sine   amp=0.6 freq=0.10 dur=30
       sine   amp=0.3 freq=0.10 dur=30
-      # ---------- 14-16. 阶跃：J 独立校验（起始加速度）+ 作动器滞后 ----------
-      step   amp=0.8 hold=0.5 count=10
-      step   amp=2.0 hold=0.5 count=10
-      step   amp=4.0 hold=0.5 count=10
-      # ---------- 17-22. 闭环 A/B 跟踪（±30° 脚本轨迹），baseline/model 交替各 3 次 ----------
+
+      # ================= 六、阶跃：J 独立校验 + 作动器滞后 =================
+      # 18-20. hold 用 0.3 s（原 0.5 s）：阶跃的偏转主要来自"半拍内累积的位移"，
+      #        缩短后偏转从 ~2 rad 压到 ~0.55 rad；而且更短的阶跃更贴近初始加速度段，
+      #        对 J 的辨识反而更有利。
+      step   amp=0.8 hold=0.3 count=10
+      step   amp=1.5 hold=0.3 count=10
+      step   amp=2.0 hold=0.3 count=10
+
+      # ================= 七、闭环 A/B 跟踪（±30° 脚本轨迹）=================
+      # 22-27. baseline/model 交替各 3 次
       track  mode=baseline dur=20
       track  mode=model    dur=20
       track  mode=baseline dur=20
       track  mode=model    dur=20
       track  mode=baseline dur=20
       track  mode=model    dur=20
-      # ---------- 23-26. 加热段：把电机烤到 50~60 °C（每组记录温度，>65 °C 立即停）----------
-      sine   amp=3.0 freq=0.50 dur=40
-      sine   amp=3.5 freq=0.50 dur=40
-      sine   amp=3.0 freq=0.50 dur=40
-      sine   amp=2.5 freq=0.50 dur=40
-      # ---------- 27-30. 热机重复（与 4 / 8 / 12 对照，用于激励温度轴）----------
-      sine   amp=1.0 freq=0.50 dur=20
-      sine   amp=2.5 freq=0.50 dur=20
-      sine   amp=0.6 freq=0.10 dur=30
-      track  mode=model    dur=20
+
+      # ================= 八、遥控随机控制响应 =================
+      # 28-29. yaw 控制权交还遥控（云台原 PID 闭环），操作者自由随机摆动：
+      #   · 覆盖真实使用工况，检验模型在闭环随机输入下的预测能力
+      #   · 本段不施加脚本激励；实际作用力矩见 CSV 的 measured_torque 列
+      #   ★ 触发后用左摇杆/鼠标持续随机摆动 yaw，幅度与速度尽量多样化
+      rc dur=60
+      rc dur=60
 
     # ---- 传统模式参数（condition_schedule 留空时才生效；扫描模式下仅作解析默认值）----
     static_duration_s: 15.0      # 静置时长
@@ -133,10 +164,39 @@ yaw_identification_controller:
     step_duration_s: 0.5         # 每拍阶跃时长
     step_count: 10               # 阶跃拍数（正负交替）
     # ---- 安全限幅：扫描模式下每条工况的幅值都会在启动时逐条校验，超限直接报错 ----
-    torque_limit: 4.2            # 激励力矩硬限幅（原 1.5；扫幅值需要放到 4.0）
+    torque_limit: 2.5            # 激励力矩硬限幅：受 pitch 力矩余量约束（3.5 N*m 会把 pitch 撞掉）
     abort_velocity: 10.0         # IMU 角速度超限自动中止 rad/s
                                  # 原 6.0 —— 4 N*m @ 0.3 Hz 峰值预测 ≈7 rad/s 会误触发中止
     csv_directory: "/tmp"
+    # ---- 连续测试模式 ----
+    # auto_advance=true：一次触发自动跑完【全部】工况，条目之间插入静置间隔；
+    #   期间 yaw 交还遥控、不记录，等系统静止后再自动开下一条（每条仍是独立 CSV）
+    #   中止方式不变：遥控双下 / 角速度超限 / 温度超限
+    auto_advance: true
+    inter_condition_gap_s: 10.0  # 相邻工况之间的静置间隔（秒）
+    # ---- 温度保护 ----
+    # 运行/间隔期间任一电机温度达到该值即中止整场测试（已采集 CSV 保留）。
+    # 说明：pitch 电机持续保持炮管（约 3 N*m 持续负载），实测温升 ≈3 °C/min，
+    #       从 ~35 °C 起约 13 分钟到 70 °C —— 长时间连续测试会被这一项保护性中止；
+    #       让它冷却后再次触发即可从被中止的那条继续（其余条不会重跑）。
+    #       设为 0 或负数则关闭该保护。
+    abort_temperature_c: 70.0
+    # ---- yaw 行程保护（线缆缠绕 / 机械干涉的安全网）----
+    # 单条工况内 yaw 相对本条起始位置的偏转超过该值即中止该条并打印提示。
+    # 实测依据（2026-09-29）：
+    #   · yaw 转 143° 时 pitch 世界角仅变化 0.96°、力矩稳定保持 → 此范围内安全
+    #   · yaw 转约 288° 时 pitch 被拽到机械下限(-10°)、yaw 同时卡死（激励 1 N*m 转速为 0）
+    #   · 快速旋转时 pitch 已有 0.25° 轻微下沉 → 耦合随转角增大
+    # 取 2.2 rad(126°)：实测 2.5 rad(143°) 时 pitch 世界角仅变 0.96°、力矩稳定保持，
+    # 故 2.2 rad 有实测依据并留 12% 余量。偏转估计需注意【启动过冲】：从静止起振时
+    # 第一半周期会过冲约 1.7 倍（机械时间常数 0.34 s 与 1 Hz 周期可比），所以
+    # 高扭矩条目要放到更高频率上（偏转 ∝ 1/f，而 ω_peak 与 f 无关）。
+    yaw_excursion_limit_rad: 2.2
+    # ---- 续跑起点（1 起）----
+    # 中止后若重启了程序（改了配置/重新部署），计数会归零；把这里改成中止条目号
+    # 即可让下次触发从中断处继续，前面已采集的条目不必重跑。
+    # 正常运行期间保持 1（配合 auto_advance，中止后直接在原地再触发就能续跑）。
+    start_from_condition: 14
     # ---- 跟踪段（A/B 对照实验） ----
     track_duration_s: 20.0       # 跟踪时长（阶跃10s + 正弦10s）
     track_step_angle_deg: 30.0   # 跟踪阶跃目标角
@@ -144,7 +204,7 @@ yaw_identification_controller:
     track_sine_amplitude_deg: 30.0
     track_sine_frequency_hz: 0.5
     track_transition_s: 0.3      # 阶跃平滑过渡时长（保证参考加速度有限）
-    track_torque_limit: 4.5      # 跟踪段总力矩限幅（须 >= torque_limit；CAN ±2048 ≈ ±4.5 N*m 是硬顶）
+    track_torque_limit: 2.5      # 跟踪段总力矩限幅，同样受 pitch 余量约束（须 >= torque_limit）
     control_mode: "model"        # 传统模式下 track 段用哪个模式
     # ---- 辨识得到的模型参数 ----
     # 2026-09-26 版（1ms 一步 ARX）: J=0.1503 B=0.6605 tau_c=0.201（R2=0.999/0.995）
@@ -242,7 +302,12 @@ gimbal_controller:
     pitch_velocity_ff_gain: 0.378
     pitch_acceleration_ff_gain: 0.0396
 
-    pitch_gravity_ff_gain: 2.575
+    # 重力前馈：2026-09-29 实车标定（rc 段 5 个俯仰角保持，实测保持力矩 vs 前馈）
+    #   实测稳态保持力矩 ≈ -3.0 ~ -3.6 N*m，原增益 2.575 只给到 ≈ -2.5 N*m，
+    #   短约 0.6 N*m（差额长期由 PID 积分承担）。按实测比例上调至 3.3。
+    #   注：这只让前馈承担应有的份额、改善动态响应；炮管所需的保持力矩本身不变，
+    #       因此电机持续电流与发热不会因此下降（发热需靠机械配平解决）。
+    pitch_gravity_ff_gain: 3.3
     pitch_gravity_ff_phase: 1.784
 
     pitch_torque_control: true

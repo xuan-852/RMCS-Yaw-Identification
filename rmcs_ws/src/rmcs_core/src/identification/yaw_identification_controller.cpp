@@ -11,9 +11,12 @@
 #include <string>
 #include <vector>
 
+#include <eigen3/Eigen/Geometry>
+#include <fast_tf/fast_tf.hpp>
 #include <pluginlib/class_list_macros.hpp>
 #include <rclcpp/logging.hpp>
 #include <rclcpp/node.hpp>
+#include <rmcs_description/tf_description.hpp>
 #include <rmcs_executor/component.hpp>
 #include <rmcs_msgs/switch.hpp>
 #include <rmcs_utility/csv_writer.hpp>
@@ -58,7 +61,8 @@ std::string trim(const std::string& text) {
 
 /// 工况类型。序号同时写入 CSV 的 phase 列，沿用历史语义：
 ///   0 static（静置，零偏）  1 sine（正弦）  2 step（正负交替阶跃）  3 track（闭环跟踪 A/B）
-enum class ConditionType : int { kStatic = 0, kSine = 1, kStep = 2, kTrack = 3 };
+///   4 rc（遥控随机控制：不施加脚本激励，yaw 控制权交还云台控制器，仅记录响应）
+enum class ConditionType : int { kStatic = 0, kSine = 1, kStep = 2, kTrack = 3, kRc = 4 };
 
 const char* condition_type_name(ConditionType type) {
     switch (type) {
@@ -66,6 +70,7 @@ const char* condition_type_name(ConditionType type) {
     case ConditionType::kSine: return "sine";
     case ConditionType::kStep: return "step";
     case ConditionType::kTrack: return "track";
+    case ConditionType::kRc: return "rc";
     }
     return "unknown";
 }
@@ -104,7 +109,8 @@ struct Condition {
 ///     sine   amp=1.0 freq=0.20 dur=20
 ///     step   amp=2.0 hold=0.5 count=10        （dur 可省略，自动 = hold*count）
 ///     track  mode=baseline dur=20
-///   必填：static/sine/track 需要 dur；sine 还需 amp+freq；step 需要 amp+hold+count；track 还需 mode。
+///     rc     dur=60                            （遥控随机控制段，只记录不激励）
+///   必填：static/sine/track/rc 需要 dur；sine 还需 amp+freq；step 需要 amp+hold+count；track 还需 mode。
 ///   可选：id=（默认按行号 1..N）。
 ///   任何语法/取值错误都会在**组件启动时**抛异常（快速失败，避免上车才发现）。
 ///
@@ -128,6 +134,12 @@ public:
         , torque_limit_(parameter_or_declare(*this, "torque_limit", 1.5))
         , abort_velocity_(parameter_or_declare(*this, "abort_velocity", 6.0))
         , csv_directory_(parameter_or_declare(*this, "csv_directory", std::string{"/tmp"}))
+        , auto_advance_(parameter_or_declare(*this, "auto_advance", false))
+        , inter_condition_gap_s_(parameter_or_declare(*this, "inter_condition_gap_s", 10.0))
+        , abort_temperature_c_(parameter_or_declare(*this, "abort_temperature_c", 75.0))
+        , yaw_excursion_limit_rad_(
+              parameter_or_declare(*this, "yaw_excursion_limit_rad", 2.5))
+        , start_from_condition_(parameter_or_declare(*this, "start_from_condition", 1))
         , track_duration_s_(parameter_or_declare(*this, "track_duration_s", 20.0))
         , track_step_angle_rad_(
               parameter_or_declare(*this, "track_step_angle_deg", 30.0) * std::numbers::pi_v<double> / 180.0)
@@ -149,6 +161,8 @@ public:
         if (static_duration_s_ <= 0.0 || sine_duration_s_ <= 0.0 || step_duration_s_ <= 0.0
             || track_duration_s_ <= 0.0 || track_step_hold_s_ <= 0.0 || track_transition_s_ <= 0.0)
             throw std::runtime_error("durations must be positive");
+        if (!(inter_condition_gap_s_ > 0.0))
+            throw std::runtime_error("inter_condition_gap_s must be > 0");
         if (sine_frequency_hz_ <= 0.0 || track_sine_frequency_hz_ <= 0.0)
             throw std::runtime_error("frequencies must be positive");
         if (step_count_ < 1)
@@ -184,7 +198,17 @@ public:
         register_input("/gimbal/yaw/angle", yaw_angle_);
         register_input("/gimbal/yaw/temperature", yaw_temperature_);
         register_input("/gimbal/pitch/angle", pitch_angle_);
-        register_input("/gimbal/yaw/control_torque", yaw_control_torque_);
+        // pitch 监控：全部取硬件侧信号（读它们不构成循环依赖，云台控制器不依赖本组件以外的这些源）
+        //   pitch_torque      = 电调反馈电流换算的实测力矩（保持炮管所需的重力力矩）
+        //   pitch_temperature = 电调上报温度（用于排查过热降额）
+        //   /tf               = 解算炮管世界俯仰角，便于与 pitch_gravity_ff_* 前馈项直接比对
+        register_input("/gimbal/pitch/torque", pitch_torque_);
+        register_input("/gimbal/pitch/temperature", pitch_temperature_);
+        register_input("/tf", tf_);
+        // 注意：本组件【不能】读 /gimbal/yaw/control_torque。
+        // 云台控制器需要本组件的 identification_active / identification_torque 才能输出激励力矩，
+        // 本组件若再读它的输出就构成循环依赖，执行器会在配对阶段直接卡死（一次 tick 都不跑）。
+        // 激励期间 yaw 指令力矩恒等于 excitation_torque（交接逻辑直接转发），CSV 已记录该列。
 
         register_output("/gimbal/yaw/identification_torque", identification_torque_, nan_);
         register_output("/gimbal/yaw/identification_active", identification_active_, false);
@@ -222,10 +246,17 @@ public:
         *identification_active_ = false;
         last_switch_left_ = rmcs_msgs::Switch::UNKNOWN;
         last_switch_right_ = rmcs_msgs::Switch::UNKNOWN;
-        next_condition_ = 0;
-        // 可选输入：若上游没有发布者（例如云台控制器被移除），绑到 NaN，避免解引用空引用
-        if (!yaw_control_torque_.ready())
-            yaw_control_torque_.bind_directly(nan_);
+        next_condition_ = start_from_condition_ <= 1
+                            ? 0
+                            : std::min<std::size_t>(
+                                  static_cast<std::size_t>(start_from_condition_ - 1),
+                                  schedule_.size() - 1);
+        if (next_condition_ > 0)
+            RCLCPP_INFO(
+                get_logger(),
+                "Yaw identification: start_from_condition=%d -> 下次触发从工况 id=%d (%s) 开始",
+                start_from_condition_, schedule_[next_condition_].id,
+                condition_type_name(schedule_[next_condition_].type));
     }
 
     void update() override {
@@ -244,6 +275,25 @@ public:
             *identification_active_ = false;
             store_switch_state(current_switch_left, current_switch_right);
             return;
+        }
+
+        // 温度保护：运行/间隔期间任一电机温度达到上限，立即中止整场测试（已采集的 CSV 保留）
+        if (abort_temperature_c_ > 0.0 && (phase_ == Phase::kRunning || phase_ == Phase::kGap)) {
+            const double yaw_t = *yaw_temperature_;
+            const double pitch_t = *pitch_temperature_;
+            const double hottest = std::max(yaw_t, pitch_t);
+            if (std::isfinite(hottest) && hottest >= abort_temperature_c_) {
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "Yaw identification: ABORT — motor temperature %.0f C reached the %.0f C limit "
+                    "(yaw %.0f C, pitch %.0f C). Let the motors cool down before resuming.",
+                    hottest, abort_temperature_c_, yaw_t, pitch_t);
+                finish_test("temperature limit");
+                *identification_torque_ = nan_;
+                *identification_active_ = false;
+                store_switch_state(current_switch_left, current_switch_right);
+                return;
+            }
         }
 
         if (phase_ == Phase::kIdle) {
@@ -269,6 +319,26 @@ public:
             }
         }
 
+        if (phase_ == Phase::kGap) {
+            // 静置间隔：yaw 交还遥控、停止记录，等系统彻底静止后再自动开始下一条工况
+            *identification_torque_ = nan_;
+            *identification_active_ = false;
+            const double gap_elapsed_s =
+                std::chrono::duration<double>(*timestamp_ - gap_start_time_).count();
+            if (gap_elapsed_s >= inter_condition_gap_s_ && next_condition_ < schedule_.size()) {
+                RCLCPP_INFO(
+                    get_logger(),
+                    "Yaw identification: settling gap done (%.1f s), starting condition id=%d (%s)",
+                    gap_elapsed_s, schedule_[next_condition_].id,
+                    condition_type_name(schedule_[next_condition_].type));
+                start_test(next_condition_);
+            }
+            if (phase_ == Phase::kGap) {
+                store_switch_state(current_switch_left, current_switch_right);
+                return;
+            }
+        }
+
         const double elapsed_s =
             std::chrono::duration<double>(*timestamp_ - test_start_time_).count();
 
@@ -276,6 +346,15 @@ public:
 
         const Condition& condition = schedule_[current_condition_];
         const double local_s = elapsed_s - condition_start_elapsed_s_;
+
+        // 记录本条工况的 yaw 起始角，用于限制摆动行程。
+        // 低频大扭矩工况会让 yaw 朝一个方向持续转出很大角度（例如 0.05 Hz @ 1 N·m
+        // 约 0.8 圈），实测会把线缆拉紧 / 产生机械干涉——先把 pitch 拽到机械下限，
+        // 再把 yaw 一起卡死。因此按工况限制行程，超限立即中止并提示检查。
+        if (condition_origin_id_ != current_condition_) {
+            condition_origin_id_ = current_condition_;
+            condition_origin_angle_ = continuous_angle_;
+        }
 
         double excitation = 0.0;
         double ff_torque = nan_;
@@ -350,6 +429,13 @@ public:
             ref_velocity = reference_velocity_;
             break;
         }
+
+        case ConditionType::kRc:
+            // 遥控随机控制段：不施加任何脚本激励，yaw 控制权交还云台控制器（遥控驱动），
+            // 本组件只记录响应。实际作用力矩见 CSV 的 measured_torque 列（电调反馈电流换算）。
+            if (local_s >= condition.duration)
+                condition_finished = true;
+            break;
         }
 
         if (condition_finished) {
@@ -369,16 +455,55 @@ public:
                     get_logger(), "Yaw identification: condition id=%d (%s) finished at %.2fs",
                     condition.id, condition_type_name(condition.type), elapsed_s);
                 finish_test("condition finished");
+                // 自动连续模式：插入静置间隔后自动开下一条；否则停下等下一次拨杆触发
+                if (auto_advance_ && !legacy_mode_ && next_condition_ < schedule_.size()) {
+                    phase_ = Phase::kGap;
+                    gap_start_time_ = *timestamp_;
+                    RCLCPP_INFO(
+                        get_logger(),
+                        "Yaw identification: %.1f s settling gap, then condition id=%d (%s) starts "
+                        "automatically",
+                        inter_condition_gap_s_, schedule_[next_condition_].id,
+                        condition_type_name(schedule_[next_condition_].type));
+                }
             }
             store_switch_state(current_switch_left, current_switch_right);
             return;
         }
 
+        // 行程保护：单条工况内 yaw 偏转超限立即中止（线缆缠绕 / 机械干涉的安全网）
+        {
+            const double excursion_rad = std::abs(continuous_angle_ - condition_origin_angle_);
+            if (yaw_excursion_limit_rad_ > 0.0 && excursion_rad > yaw_excursion_limit_rad_) {
+                log_sample(
+                    elapsed_s, local_s, condition, excitation, ff_torque, ref_angle, ref_velocity,
+                    ref_acceleration);
+                RCLCPP_ERROR(
+                    get_logger(),
+                    "Yaw identification: ABORT — yaw excursion %.1f deg exceeds the %.1f deg limit "
+                    "(condition id=%d, %s). 疑似线缆缠绕或机械干涉，请检查后再继续。",
+                    excursion_rad * 180.0 / std::numbers::pi_v<double>,
+                    yaw_excursion_limit_rad_ * 180.0 / std::numbers::pi_v<double>, condition.id,
+                    condition_type_name(condition.type));
+                *identification_torque_ = nan_;
+                *identification_active_ = false;
+                abort_test("yaw excursion limit");
+                store_switch_state(current_switch_left, current_switch_right);
+                return;
+            }
+        }
+
         const double limit =
             (condition.type == ConditionType::kTrack) ? track_torque_limit_ : torque_limit_;
-        excitation = std::clamp(excitation, -limit, limit);
-        *identification_torque_ = excitation;
-        *identification_active_ = true;
+        if (condition.type == ConditionType::kRc) {
+            // RC 段不接管 yaw：identification_active=false，云台控制器按遥控正常闭环
+            *identification_torque_ = nan_;
+            *identification_active_ = false;
+        } else {
+            excitation = std::clamp(excitation, -limit, limit);
+            *identification_torque_ = excitation;
+            *identification_active_ = true;
+        }
 
         if (std::abs(*yaw_velocity_imu_) > abort_velocity_) {
             log_sample(
@@ -402,7 +527,7 @@ private:
     static constexpr double nan_ = std::numeric_limits<double>::quiet_NaN();
     static constexpr auto kFlushInterval = std::chrono::duration<double>(0.1);
 
-    enum class Phase { kIdle, kRunning };
+    enum class Phase { kIdle, kRunning, kGap };
 
     /// 传统模式的 4 段协议（与历史版本逐位一致）
     std::vector<Condition> legacy_schedule() const {
@@ -449,11 +574,13 @@ private:
                 condition.type = ConditionType::kStep;
             else if (type_token == "track")
                 condition.type = ConditionType::kTrack;
+            else if (type_token == "rc")
+                condition.type = ConditionType::kRc;
             else
                 throw std::runtime_error(
                     "condition_schedule line " + std::to_string(line_number)
                     + ": unknown type '" + type_token
-                    + "' (expected static|sine|step|track)");
+                    + "' (expected static|sine|step|track|rc)");
 
             std::string token;
             while (tokens >> token) {
@@ -556,6 +683,15 @@ private:
         }
     }
 
+    /// 炮管方向在世界系（OdomImu）中的俯仰角——与云台控制器重力前馈
+    /// pitch_gravity_ff_gain * sin(world_pitch - pitch_gravity_ff_phase) 用的是同一个量。
+    /// 用它可以判定前馈项是否恰好等于保持炮管所需的实测重力力矩。
+    double pitch_world_angle() const {
+        auto dir = fast_tf::cast<rmcs_description::OdomImu>(
+            rmcs_description::PitchLink::DirectionVector{Eigen::Vector3d::UnitX()}, *tf_);
+        return std::asin(std::clamp(dir->z(), -1.0, 1.0));
+    }
+
     void update_continuous_angle() {
         const double raw = *yaw_angle_;
         if (!angle_initialized_) {
@@ -627,7 +763,7 @@ private:
                 "reference_velocity", "reference_acceleration", "measured_torque",
                 "measured_velocity", "measured_velocity_imu", "measured_angle", "pitch_angle",
                 "temperature", "condition_id", "condition_type", "condition_elapsed_s",
-                "wallclock_s", "control_torque");
+                "wallclock_s", "pitch_torque", "pitch_temperature", "pitch_world_angle");
             csv_writer_.flush();
         } catch (const std::exception& exception) {
             RCLCPP_ERROR(get_logger(), "Failed to write identification log header: %s", exception.what());
@@ -669,7 +805,7 @@ private:
                 ref_velocity, ref_acceleration, *yaw_torque_, *yaw_velocity_, *yaw_velocity_imu_,
                 *yaw_angle_, *pitch_angle_, *yaw_temperature_, condition.id,
                 condition_type_name(condition.type), local_s, test_start_wallclock_s_ + elapsed_s,
-                *yaw_control_torque_);
+                *pitch_torque_, *pitch_temperature_, pitch_world_angle());
         } catch (const std::exception& exception) {
             RCLCPP_ERROR(get_logger(), "Failed to write identification sample: %s", exception.what());
         }
@@ -714,6 +850,11 @@ private:
     const double torque_limit_;
     const double abort_velocity_;
     const std::string csv_directory_;
+    const bool auto_advance_;              // 一次触发跑完全部工况（条目间插静置间隔）
+    const double inter_condition_gap_s_;   // 相邻工况之间的静置间隔
+    const double abort_temperature_c_;     // 电机温度上限（<=0 表示不启用）
+    const double yaw_excursion_limit_rad_; // 单条工况内 yaw 允许的偏转行程（<=0 表示不启用）
+    const int start_from_condition_;       // 从第几条工况开始（1 起；>1 用于中止后续跑）
 
     const double track_duration_s_;
     const double track_step_angle_rad_;
@@ -740,10 +881,13 @@ private:
     Phase phase_ = Phase::kIdle;
     Clock::time_point test_start_time_{};
     Clock::time_point next_flush_time_{};
+    Clock::time_point gap_start_time_{};
     double test_start_wallclock_s_ = 0.0;
 
     bool angle_initialized_ = false;
     double continuous_angle_ = 0.0;
+    double condition_origin_angle_ = 0.0; // 本条工况开始时的 yaw 连续角
+    std::size_t condition_origin_id_ = std::numeric_limits<std::size_t>::max();
     double previous_raw_angle_ = 0.0;
 
     bool tracking_initialized_ = false;
@@ -767,7 +911,9 @@ private:
     InputInterface<double> yaw_angle_;
     InputInterface<double> yaw_temperature_;
     InputInterface<double> pitch_angle_;
-    InputInterface<double> yaw_control_torque_;
+    InputInterface<double> pitch_torque_;
+    InputInterface<double> pitch_temperature_;
+    InputInterface<rmcs_description::Tf> tf_;
 
     OutputInterface<double> identification_torque_;
     OutputInterface<bool> identification_active_;
