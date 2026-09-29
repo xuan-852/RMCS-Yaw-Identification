@@ -140,12 +140,15 @@ yaw_identification_controller:
 
       # ================= 七、闭环 A/B 跟踪（±30° 脚本轨迹）=================
       # 22-27. baseline/model 交替各 3 次
-      track  mode=baseline dur=20
-      track  mode=model    dur=20
-      track  mode=baseline dur=20
-      track  mode=model    dur=20
-      track  mode=baseline dur=20
-      track  mode=model    dur=20
+      # 过渡改 0.6 s（原 0.3）：模型算出 0.3 s 需要 4.6 N*m，远超 2.5 N*m 限幅 → 必然饱和、
+      # 前馈优势被抹平。0.6 s 时力矩峰值降到约 1.5 N*m（60% 限幅），三组对比才干净。
+      # kp_a 覆盖角度环增益：10=原 PID；25=按 zeta=1 解析整定（wn=1/(2*tau_v)）。
+      track  mode=baseline kp_a=10 dur=20   # A 原 PID
+      track  mode=baseline kp_a=25 dur=20   # B 模型整定（仅改 kp_a）
+      track  mode=model    kp_a=25 dur=20   # C 模型整定 + 模型前馈
+      track  mode=baseline kp_a=10 dur=20   # A 重复
+      track  mode=baseline kp_a=25 dur=20   # B 重复
+      track  mode=model    kp_a=25 dur=20   # C 重复
 
       # ================= 八、遥控随机控制响应 =================
       # 28-29. yaw 控制权交还遥控（云台原 PID 闭环），操作者自由随机摆动：
@@ -164,7 +167,10 @@ yaw_identification_controller:
     step_duration_s: 0.5         # 每拍阶跃时长
     step_count: 10               # 阶跃拍数（正负交替）
     # ---- 安全限幅：扫描模式下每条工况的幅值都会在启动时逐条校验，超限直接报错 ----
-    torque_limit: 2.5            # 激励力矩硬限幅：受 pitch 力矩余量约束（3.5 N*m 会把 pitch 撞掉）
+    # 2026-09-29 第三轮放宽：测试前先把 pitch 预先落到机械限位（被结构托住，只需 ~1 N*m），
+    # 于是 pitch 不会再中途掉落，也不会额外增加摩擦 —— 真正会导致卡死的是 yaw 大行程
+    # （线缆拉紧），那由 yaw_excursion_limit_rad=2.2 独立保护。故 yaw 限幅放宽到 4.0。
+    torque_limit: 4.0
     abort_velocity: 10.0         # IMU 角速度超限自动中止 rad/s
                                  # 原 6.0 —— 4 N*m @ 0.3 Hz 峰值预测 ≈7 rad/s 会误触发中止
     csv_directory: "/tmp"
@@ -196,15 +202,15 @@ yaw_identification_controller:
     # 中止后若重启了程序（改了配置/重新部署），计数会归零；把这里改成中止条目号
     # 即可让下次触发从中断处继续，前面已采集的条目不必重跑。
     # 正常运行期间保持 1（配合 auto_advance，中止后直接在原地再触发就能续跑）。
-    start_from_condition: 14
+    start_from_condition: 21
     # ---- 跟踪段（A/B 对照实验） ----
     track_duration_s: 20.0       # 跟踪时长（阶跃10s + 正弦10s）
     track_step_angle_deg: 30.0   # 跟踪阶跃目标角
     track_step_hold_s: 2.5       # 每拍保持时长（4拍：+30/-30/+30/0 度）
     track_sine_amplitude_deg: 30.0
     track_sine_frequency_hz: 0.5
-    track_transition_s: 0.3      # 阶跃平滑过渡时长（保证参考加速度有限）
-    track_torque_limit: 2.5      # 跟踪段总力矩限幅，同样受 pitch 余量约束（须 >= torque_limit）
+    track_transition_s: 0.6      # 阶跃平滑过渡时长（保证参考加速度有限）
+    track_torque_limit: 4.0      # 跟踪段总力矩限幅（放宽后 A/B 不再饱和）
     control_mode: "model"        # 传统模式下 track 段用哪个模式
     # ---- 辨识得到的模型参数 ----
     # 2026-09-26 版（1ms 一步 ARX）: J=0.1503 B=0.6605 tau_c=0.201（R2=0.999/0.995）

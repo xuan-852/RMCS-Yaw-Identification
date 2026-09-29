@@ -83,7 +83,8 @@ struct Condition {
     double duration = 0.0;    // s，全部类型
     double step_hold = 0.0;   // s，step 每拍时长
     int step_count = 0;       // step 拍数
-    std::string control_mode; // track: "baseline" | "model"
+    std::string control_mode; // baseline(无前馈) | model(带模型前馈)
+    double kp_a = 0.0;        // track: 角度环增益覆盖（0=用 yaw_kp_angle_） // track: "baseline" | "model"
 };
 
 } // namespace
@@ -414,7 +415,8 @@ public:
             velocity_integrator_ = std::clamp(
                 velocity_integrator_ + velocity_error, -yaw_velocity_integral_limit_,
                 yaw_velocity_integral_limit_);
-            double torque = yaw_kp_velocity_ * (yaw_kp_angle_ * angle_error + velocity_error)
+            const double kp_angle = condition.kp_a > 0.0 ? condition.kp_a : yaw_kp_angle_;
+            double torque = yaw_kp_velocity_ * (kp_angle * angle_error + velocity_error)
                           + yaw_ki_velocity_ * velocity_integrator_;
 
             if (condition.control_mode == "model") {
@@ -619,6 +621,8 @@ private:
                     condition.step_count = static_cast<int>(to_double());
                 else if (key == "mode" || key == "control_mode")
                     condition.control_mode = value;
+                else if (key == "kp_a" || key == "angle_kp")
+                    condition.kp_a = to_double();
                 else
                     throw std::runtime_error(
                         "condition_schedule line " + std::to_string(line_number)
